@@ -398,22 +398,24 @@ def _age_text(levels):
         return f"as of {as_of}"
 
 
-def build_recommendation(levels):
-    """One plain-English recommendation: try buys, try sells, or wait.
+def _dist_text(spot, wall):
+    if spot is None or wall is None:
+        return ""
+    try:
+        return f" ({abs(float(spot) - float(wall)):,.0f} away)"
+    except Exception:
+        return ""
 
-    User requirement 2026-11-24: add a recommendation like calls / puts /
-    choppy / don't try / wait to the alert. Rules, in priority order:
-      - near ceiling: don't chase buys up here, wait for pullback or break-and-hold
-      - near floor: don't chase sells down here, wait for bounce or break-and-hold
-      - mood line not clear + choppy: don't force a trade, wait for a clear move
-      - above mood line: buys look better than sells, look for buys on a pullback
-      - below mood line: sells look better than buys, look for sells on a bounce
-      - near drift-toward price: may stay quiet, wait for a clear move away
-      - otherwise: no clear lean, wait for a move toward ceiling or floor
-    No jargon, no scores, no percentages. One or two short sentences.
+
+def build_action(levels):
+    """Short action for quick trading: (headline, what_changes_this).
+
+    User choice 2026-11-24: shorter version, action first, 5 lines for
+    morning/close, 3 lines for a live gate alert. No jargon.
+    Headline is one of: WAIT / BUYS LOOK BETTER / SELLS LOOK BETTER.
     """
     if not levels:
-        return "Wait - levels are not clear yet today, don't force a trade."
+        return ("WAIT — Levels not clear", "Wait, don't force a trade.")
     spot = levels.get("spot")
     call_wall = levels.get("call_wall")
     put_wall = levels.get("put_wall")
@@ -427,83 +429,67 @@ def build_recommendation(levels):
         pain_f = float(max_pain) if max_pain is not None else None
         flip_f = float(flip) if flip is not None else None
     except Exception:
-        return "Wait - levels are not clear yet today, don't force a trade."
+        return ("WAIT — Levels not clear", "Wait, don't force a trade.")
     if spot_f is not None and call_f is not None and abs(spot_f - call_f) <= 50:
-        return "Don't chase buys up here. Wait for price to pull back, or wait for it to break above the ceiling and stay there."
+        return ("WAIT — Don't chase buys",
+                f"If price breaks above {fmt_money(call_wall)} and stays there, buys. If it turns back down, wait.")
     if spot_f is not None and floor_f is not None and abs(spot_f - floor_f) <= 50:
-        return "Don't chase sells down here. Wait for price to bounce up, or wait for it to break below the floor and stay there."
+        return ("WAIT — Don't chase sells",
+                f"If price breaks below {fmt_money(put_wall)} and stays there, sells. If it bounces up, wait.")
     if flip_f is None and net is not None and net < 0:
-        return "Choppy today, don't force a trade. Wait for a clear move up or down."
+        return ("WAIT — Choppy, don't force a trade",
+                "Wait for a clear move up or down.")
     if flip_f is not None and spot_f is not None:
         if spot_f > flip_f:
-            return "Buys look better than sells today. Look for buys on a pullback, don't chase sells."
-        return "Sells look better than buys today. Look for sells on a bounce, don't chase buys."
+            return ("BUYS LOOK BETTER",
+                    "If price pulls back and holds above the mood line, buys. If it drops below the mood line, wait.")
+        return ("SELLS LOOK BETTER",
+                "If price bounces and holds below the mood line, sells. If it climbs above the mood line, wait.")
     if spot_f is not None and pain_f is not None and abs(spot_f - pain_f) <= 25:
-        return "Price is near where it tends to drift toward, so it may stay quiet. Wait for a clear move away."
-    return "No clear lean today. Wait for price to move toward the ceiling or floor before picking a side."
+        return ("WAIT — May stay quiet",
+                f"Wait for a clear move away from {fmt_money(max_pain)}.")
+    return ("WAIT — No clear lean",
+            "Wait for price to move toward the ceiling or floor before picking a side.")
+
+
+def build_recommendation(levels):
+    """Back-compat: one plain-English recommendation sentence."""
+    headline, what_changes = build_action(levels)
+    if headline.startswith("WAIT — Don't chase buys"):
+        return "Don't chase buys up here. Wait for price to pull back, or wait for it to break above the ceiling and stay there."
+    if headline.startswith("WAIT — Don't chase sells"):
+        return "Don't chase sells down here. Wait for price to bounce up, or wait for it to break below the floor and stay there."
+    if headline.startswith("WAIT — Choppy"):
+        return "Choppy today, don't force a trade. Wait for a clear move up or down."
+    if headline == "BUYS LOOK BETTER":
+        return "Buys look better than sells today. Look for buys on a pullback, don't chase sells."
+    if headline == "SELLS LOOK BETTER":
+        return "Sells look better than buys today. Look for sells on a bounce, don't chase buys."
+    return what_changes
 
 
 def build_morning_message(levels, imbalance=None):
-    """Plain-English morning alert, under ~12 lines. No jargon."""
+    """Short morning alert, 5 lines. Action first, levels second. No jargon."""
     today = datetime.now(ET).strftime("%a %b %d, %Y")
     spot = levels.get("spot") if levels else None
     call_wall = levels.get("call_wall") if levels else None
     put_wall = levels.get("put_wall") if levels else None
     max_pain = levels.get("max_pain") if levels else None
     flip = levels.get("gamma_flip") if levels else None
-    net = _net_gex_number(levels)
-
     flip_line = fmt_money(flip) if flip is not None else "not clear today"
-
-    # What this means: 1-2 plain sentences, based on position vs ceiling/floor.
-    meaning_parts = []
-    if spot is not None and call_wall is not None and put_wall is not None:
-        near_ceiling = abs(float(spot) - float(call_wall)) <= 25
-        near_floor = abs(float(spot) - float(put_wall)) <= 25
-        if near_ceiling:
-            meaning_parts.append("Price is near the ceiling, so be careful buying up here.")
-        elif near_floor:
-            meaning_parts.append("Price is near the floor, so be careful selling down here.")
-        else:
-            meaning_parts.append("Price is in the middle, no strong push either way.")
-    if flip is None:
-        meaning_parts.append("The mood line is not clear today, so take the ceiling and floor as a rough range only.")
-    elif spot is not None:
-        if float(spot) > float(flip):
-            meaning_parts.append("Price is above the mood line, so buyers have the upper hand for now.")
-        else:
-            meaning_parts.append("Price is below the mood line, so sellers have the upper hand for now.")
-    meaning = " ".join(meaning_parts) or "Levels are not clear yet today."
-
-    # Watch out for: one plain warning if relevant.
-    warning = None
-    if net is not None and net < 0:
-        warning = "Moves can get bigger and choppier today."
-    elif net is not None and net > 0:
-        warning = "Moves tend to stay calmer today."
-
+    headline, what_changes = build_action(levels)
     lines = [
-        f"SPX today - {today}",
-        f"Price now: {fmt_money(spot)}",
-        f"Ceiling to watch: {fmt_money(call_wall)}",
-        f"Floor to watch: {fmt_money(put_wall)}",
-        f"Price tends to drift toward: {fmt_money(max_pain)}",
-        f"Mood line: {flip_line}",
-        f"What this means: {meaning}",
-        f"Recommendation: {build_recommendation(levels)}",
+        f"SPX today - {today} - {headline}",
+        f"Price {fmt_money(spot)}",
+        f"Ceiling {fmt_money(call_wall)}{_dist_text(spot, call_wall)} | Floor {fmt_money(put_wall)}{_dist_text(spot, put_wall)}",
+        f"Drift toward: {fmt_money(max_pain)} | Mood line: {flip_line}",
+        f"What changes this: {what_changes}",
     ]
-    if warning:
-        lines.append(f"Watch out for: {warning}")
-    lines.append(f"Levels from {_age_text(levels)}.")
     return "\n".join(lines)
 
 
 def build_close_message(levels):
-    """Plain-English 14:30 close alert, under ~12 lines. No jargon.
-
-    Where price is vs the price it tends to drift toward, and what to
-    watch into the close. No scores, no percentages, no pillar names.
-    """
+    """Short 14:30 close alert, 5 lines. Action first. No jargon."""
     today = datetime.now(ET).strftime("%a %b %d, %Y")
     spot = levels.get("spot") if levels else None
     call_wall = levels.get("call_wall") if levels else None
@@ -511,61 +497,32 @@ def build_close_message(levels):
     max_pain = levels.get("max_pain") if levels else None
     flip = levels.get("gamma_flip") if levels else None
     flip_line = fmt_money(flip) if flip is not None else "not clear today"
-
-    if spot is not None and max_pain is not None:
-        diff = float(spot) - float(max_pain)
-        if abs(diff) <= 25:
-            drift_line = "Price is close to where it tends to drift toward."
-            watch = "It may stay quiet into the close."
-        elif diff < 0:
-            drift_line = f"Price is ${abs(diff):,.0f} below where it tends to drift toward."
-            watch = "Watch for a slow move up into the close."
-        else:
-            drift_line = f"Price is ${diff:,.0f} above where it tends to drift toward."
-            watch = "Watch for a slow move down into the close."
-    else:
-        drift_line = "Where price tends to drift toward is not clear today."
-        watch = "Trade the ceiling and floor as a rough range into the close."
-
-    if spot is not None and call_wall is not None and abs(float(spot) - float(call_wall)) <= 25:
-        watch += " Price is near the ceiling, so be careful buying up here."
-    elif spot is not None and put_wall is not None and abs(float(spot) - float(put_wall)) <= 25:
-        watch += " Price is near the floor, so be careful selling down here."
-
+    headline, what_changes = build_action(levels)
     lines = [
-        f"SPX into the close - {today}",
-        f"Price now: {fmt_money(spot)}",
-        f"Price tends to drift toward: {fmt_money(max_pain)}",
-        drift_line,
-        f"Ceiling to watch: {fmt_money(call_wall)}",
-        f"Floor to watch: {fmt_money(put_wall)}",
-        f"Mood line: {flip_line}",
-        f"What to watch: {watch}",
-        f"Recommendation: {build_recommendation(levels)}",
-        f"Levels from {_age_text(levels)}.",
+        f"SPX into the close - {today} - {headline}",
+        f"Price {fmt_money(spot)}",
+        f"Ceiling {fmt_money(call_wall)}{_dist_text(spot, call_wall)} | Floor {fmt_money(put_wall)}{_dist_text(spot, put_wall)}",
+        f"Drift toward: {fmt_money(max_pain)} | Mood line: {flip_line}",
+        f"What changes this: {what_changes}",
     ]
     return "\n".join(lines)
 
 
 def build_gate_message(direction, price, decision, reason, levels, flip_used, flip_source):
-    """Plain-English PASSED / BLOCKED alert, under ~12 lines. No jargon."""
-    call_wall = levels.get("call_wall") if levels else None
-    put_wall = levels.get("put_wall") if levels else None
-    flip_line = fmt_money(flip_used) if flip_used is not None else "not clear today"
+    """Short live gate alert, 3 lines. Action first. No jargon."""
     if decision == "PASSED":
         if direction == "CALL":
-            rec = "Try the buy, 1 contract only. If it turns back below the mood line, get out, don't hold and hope."
+            rec = "Try the buy, 1 contract only. Get out if it turns back below the mood line."
         else:
-            rec = "Try the sell, 1 contract only. If it turns back above the mood line, get out, don't hold and hope."
+            rec = "Try the sell, 1 contract only. Get out if it turns back above the mood line."
+        action = "TRY IT"
     else:
-        rec = "Don't try this one, wait for the next clear setup."
+        rec = "Wait for the next clear setup."
+        action = "SKIP IT"
     lines = [
-        f"{decision} - {direction} at {fmt_money(price)}",
+        f"{decision} - {direction} {fmt_money(price)}, {action}",
         f"Why: {reason}",
-        f"Recommendation: {rec}",
-        f"Ceiling to watch: {fmt_money(call_wall)}",
-        f"Floor to watch: {fmt_money(put_wall)}",
-        f"Mood line: {flip_line}",
+        f"{rec}",
     ]
     return "\n".join(lines)
 
