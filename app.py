@@ -114,17 +114,26 @@ state = {
     "live_alerts": {},  # e.g. {"2026-11-24 ceiling_touch": true} - one per event per day
 }
 _state_lock = threading.Lock()
+_save_lock = threading.Lock()
 
 
 def save_state():
-    try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(state, fh, default=str)
-        os.replace(tmp, STATE_FILE)
-    except Exception as exc:  # state file is best-effort; memory is primary
-        log(f"state save failed (non-fatal): {exc}")
+    # Locked + snapshot under the state lock: poller, scheduler and gate
+    # threads all call this, and they used to share one ".tmp" path, so
+    # two concurrent saves could interleave into a corrupt state.json.
+    # A corrupt file made load_state() silently drop everything - sent
+    # morning/close marks and live-alert marks lost, so alerts repeated.
+    with _save_lock:
+        with _state_lock:
+            snapshot = json.loads(json.dumps(state, default=str))
+        try:
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            tmp = f"{STATE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump(snapshot, fh)
+            os.replace(tmp, STATE_FILE)
+        except Exception as exc:  # state file is best-effort; memory is primary
+            log(f"state save failed (non-fatal): {exc}")
 
 
 def load_state():
@@ -222,24 +231,46 @@ def fetch_imbalance(symbol="SPX"):
 
 
 def poll_once():
-    """One poll cycle: SPX 0dte + all, SPY all, 0DTE imbalance."""
+    """One poll cycle: SPX 0dte + all, SPY all, 0DTE imbalance.
+
+    The four fetches run in parallel threads, not one after another:
+    each is a curl subprocess (TLS + API round trip), so doing them in
+    sequence made a poll cycle 4-8s and pushed the real poll interval
+    to ~70s. In parallel a cycle costs roughly one fetch, ~1-2s, so a
+    level touch is seen within about a minute instead of two.
+    A slow or hung endpoint cannot stall the others: each thread joins
+    with a 40s cap, and a failed fetch only marks that key as failed.
+    """
     with _state_lock:
         state["poll_count"] += 1
     errors = []
-    for key_name, fn in (
-        ("spx_0dte", lambda: fetch_levels("SPX", "0dte")),
-        ("spx_all", lambda: fetch_levels("SPX", "all")),
-        ("spy_all", lambda: fetch_levels("SPY", "all")),
-        ("imbalance", lambda: fetch_imbalance("SPX")),
-    ):
+    results = {}
+
+    def _run(key_name, fn):
         try:
             value = fn()
-            with _state_lock:
-                state[key_name] = value
+            results[key_name] = value
             log(f"poll ok {key_name}: spot={value.get('spot')} as_of={value.get('as_of') or value.get('timestamp')}")
         except Exception as exc:
             errors.append(f"{key_name}: {exc}")
             log(f"poll failed {key_name}: {exc}")
+
+    jobs = (
+        ("spx_0dte", lambda: fetch_levels("SPX", "0dte")),
+        ("spx_all", lambda: fetch_levels("SPX", "all")),
+        ("spy_all", lambda: fetch_levels("SPY", "all")),
+        ("imbalance", lambda: fetch_imbalance("SPX")),
+    )
+    threads = []
+    for key_name, fn in jobs:
+        t = threading.Thread(target=_run, args=(key_name, fn), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=40)
+    with _state_lock:
+        for key_name, value in results.items():
+            state[key_name] = value
     now = datetime.now(timezone.utc).isoformat()
     with _state_lock:
         state["last_fetch"] = now
@@ -249,9 +280,39 @@ def poll_once():
     return not errors
 
 
+# US market full closures (NYSE holiday calendar, through mid-2027).
+# Without this the service treated Thanksgiving like a trading day:
+# it would send a morning + close alert built from stale levels and
+# poll all day while the market was shut. Early closes (1pm ET, e.g.
+# Fri Nov 27 2026, Dec 24, Dec 31) are NOT in this list - the poller
+# keeps running to 16:00 on those days, but live alerts stay quiet
+# because the API age grows past the 10-minute freshness cap.
+MARKET_HOLIDAYS = {
+    "2026-11-26",  # Thanksgiving
+    "2026-12-25",  # Christmas
+    "2027-01-01",  # New Year's Day
+    "2027-01-19",  # MLK Day
+    "2027-02-15",  # Presidents' Day
+    "2027-04-02",  # Good Friday
+    "2027-05-31",  # Memorial Day
+    "2027-06-18",  # Juneteenth (observed)
+    "2027-07-05",  # Independence Day (observed)
+    "2027-09-06",  # Labor Day
+    "2027-11-25",  # Thanksgiving
+    "2027-12-24",  # Christmas (observed)
+}
+
+
+def is_market_day(now_et=None):
+    now_et = now_et or datetime.now(ET)
+    if now_et.weekday() >= 5:
+        return False
+    return now_et.date().isoformat() not in MARKET_HOLIDAYS
+
+
 def in_session(now_et=None):
     now_et = now_et or datetime.now(ET)
-    if now_et.weekday() >= 5:  # Sat/Sun
+    if not is_market_day(now_et):
         return False
     mins = now_et.hour * 60 + now_et.minute
     return 9 * 60 + 30 <= mins < 16 * 60
@@ -267,7 +328,6 @@ def poller_loop():
                 continue
             with _state_lock:
                 prev_spot = state.get("prev_spot")
-                prev_levels = state.get("spx_0dte")
             poll_once()
             with _state_lock:
                 levels = state.get("spx_0dte")
@@ -306,13 +366,41 @@ def _send_scheduled(slot, levels):
     return bool(result.get("sent"))
 
 
+def _levels_usable_for_slot(slot, levels):
+    """Guard so a scheduled alert never goes out on yesterday's levels.
+
+    The short message format no longer prints how old the levels are,
+    so a stale send would look fresh. 0DTE levels must be for today's
+    expiry; the close alert additionally needs the API age under an
+    hour (in session the poller refreshes every ~60s, so a bigger age
+    means the poller or the API is stuck). Morning levels are the
+    previous close by design, so no age cap there - only the expiry
+    date matters. Returns (ok, reason).
+    """
+    if not levels:
+        return False, "no levels"
+    exp = levels.get("expiration_date")
+    today = datetime.now(ET).date().isoformat()
+    if exp and exp != today:
+        return False, f"levels are for {exp}, not today {today}"
+    if slot == "close":
+        age = levels.get("age_seconds")
+        if age is not None:
+            try:
+                if float(age) > 3600:
+                    return False, f"levels are {int(float(age) // 60)} minutes old"
+            except Exception:
+                pass
+    return True, ""
+
+
 def maybe_send_scheduled(now_et=None):
     """Check the schedule once. Returns the slot sent, or None.
 
     Testable on its own: pass a datetime in America/New_York.
     """
     now_et = now_et or datetime.now(ET)
-    if now_et.weekday() >= 5:
+    if not is_market_day(now_et):
         return None
     for slot, hour, minute in SCHEDULE:
         slot_start = now_et.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -324,14 +412,19 @@ def maybe_send_scheduled(now_et=None):
             if state.get("sent_slots", {}).get(key):
                 return None
             levels = state.get("spx_0dte")
-        if not levels and zerogex_key():
-            log(f"scheduler {slot}: no cached levels, fetching now")
+        ok, why = _levels_usable_for_slot(slot, levels)
+        if not ok and zerogex_key():
+            log(f"scheduler {slot}: {why}, fetching fresh once")
             try:
                 poll_once()
             except Exception as exc:
                 log(f"scheduler {slot} fetch failed: {exc}")
             with _state_lock:
                 levels = state.get("spx_0dte")
+            ok, why = _levels_usable_for_slot(slot, levels)
+        if not ok:
+            log(f"scheduler {slot}: not sending - {why}, will retry inside the window")
+            return None
         if not levels:
             log(f"scheduler {slot}: no levels available, will retry inside the window")
             return None
@@ -647,19 +740,27 @@ def check_live_levels(prev_spot, levels, now_et=None):
 
     # Work out which events fired, break before touch (a break also sits
     # within touch range - report the break, and mark touch as seen too).
+    # A break needs a real crossing: prev must exist and be on the other
+    # side. The old code fired "CEILING BROKE" on the first poll of the
+    # day whenever price simply opened above the ceiling (prev None) -
+    # a gap-up open is not a break that happened while we were watching.
+    # NOTE: the touch paired with a break goes in also_mark, NOT in
+    # events - it is a mark so a later pullback to the wall does not
+    # fire a stale touch alert, never a second Discord message.
     events = []
+    also_mark = []
     if call_f is not None:
-        broke = spot >= call_f and (prev_f is None or prev_f < call_f)
+        broke = prev_f is not None and prev_f < call_f <= spot
         if broke:
             events.append("ceiling_break")
-            events.append("ceiling_touch")  # mark seen, don't re-alert on pullback
+            also_mark.append("ceiling_touch")
         elif abs(spot - call_f) <= TOUCH_BUFFER:
             events.append("ceiling_touch")
     if floor_f is not None:
-        broke = spot <= floor_f and (prev_f is None or prev_f > floor_f)
+        broke = prev_f is not None and prev_f > floor_f >= spot
         if broke:
             events.append("floor_break")
-            events.append("floor_touch")
+            also_mark.append("floor_touch")
         elif abs(spot - floor_f) <= TOUCH_BUFFER:
             events.append("floor_touch")
     if flip_f is not None and prev_f is not None:
@@ -679,25 +780,34 @@ def check_live_levels(prev_spot, levels, now_et=None):
         pending = [e for e in events if f"{today} {e}" not in live]
         if not pending:
             return None
-        event = pending[0]
-        live[f"{today} {event}"] = True
-        if event in ("ceiling_break", "floor_break"):
-            # a break already implies the touch; mark it so a pullback
-            # to the wall does not fire a stale touch alert later
-            other = "ceiling_touch" if event == "ceiling_break" else "floor_touch"
-            live[f"{today} {other}"] = True
+        # Send every pending event, not just the first: a fast move can
+        # cross the ceiling and the mood line in one 60s poll gap, and
+        # the old code dropped all but pending[0] - the others could
+        # never fire later because the crossing was already behind us.
+        # Cap at 3 messages per poll so a wild open cannot spam Discord.
+        to_send = pending[:3]
+        for e in to_send:
+            live[f"{today} {e}"] = True
+        for e in also_mark:
+            # only mark the touch seen if its break is actually going out
+            paired = "ceiling_break" if e == "ceiling_touch" else "floor_break"
+            if paired in to_send:
+                live[f"{today} {e}"] = True
     save_state()
-    msg = build_live_message(event, levels, spot)
-    result = post_discord(msg)
-    if result.get("sent"):
-        log(f"live alert sent: {event} at spot {spot}")
-        return event
-    # send failed - unmark so it retries on the next poll
-    with _state_lock:
-        state.get("live_alerts", {}).pop(f"{today} {event}", None)
-    save_state()
-    log(f"live alert {event}: Discord send failed, will retry next poll")
-    return None
+    sent_any = None
+    for event in to_send:
+        msg = build_live_message(event, levels, spot)
+        result = post_discord(msg)
+        if result.get("sent"):
+            log(f"live alert sent: {event} at spot {spot}")
+            sent_any = event if sent_any is None else sent_any
+        else:
+            # send failed - unmark so it retries on the next poll
+            with _state_lock:
+                state.get("live_alerts", {}).pop(f"{today} {event}", None)
+            save_state()
+            log(f"live alert {event}: Discord send failed, will retry next poll")
+    return sent_any
 
 
 # ---------------------------------------------------------------- gate logic
@@ -714,6 +824,16 @@ def _fresh_levels():
         return None, "levels have no usable fetch time"
     if age > FRESH_SECONDS:
         return None, f"stale - levels are {int(age // 60)} minutes old"
+    # fetched_at only says when WE fetched; the API's own age says how
+    # old the data itself is. A fetch that returns yesterday's cached
+    # snapshot would pass the check above and wrongly green-light a gate.
+    api_age = levels.get("age_seconds")
+    if api_age is not None:
+        try:
+            if float(api_age) > FRESH_SECONDS:
+                return None, f"stale - API data is {int(float(api_age) // 60)} minutes old"
+        except Exception:
+            pass
     return levels, None
 
 
