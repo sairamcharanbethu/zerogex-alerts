@@ -436,7 +436,7 @@ def build_action(levels):
 
     User choice 2026-11-24: shorter version, action first, 5 lines for
     morning/close, 3 lines for a live gate alert. No jargon.
-    Headline is one of: WAIT / BUYS LOOK BETTER / SELLS LOOK BETTER.
+    Headline is one of: WAIT / CALLS LOOK BETTER / PUTS LOOK BETTER.
     """
     if not levels:
         return ("WAIT — Levels not clear", "Wait, don't force a trade.")
@@ -455,20 +455,20 @@ def build_action(levels):
     except Exception:
         return ("WAIT — Levels not clear", "Wait, don't force a trade.")
     if spot_f is not None and call_f is not None and abs(spot_f - call_f) <= 50:
-        return ("WAIT — Don't chase buys",
-                f"If price breaks above {fmt_money(call_wall)} and stays there, buys. If it turns back down, wait.")
+        return ("WAIT — Don't chase calls",
+                f"If price breaks above {fmt_money(call_wall)} and stays there, calls. If it turns back down, wait.")
     if spot_f is not None and floor_f is not None and abs(spot_f - floor_f) <= 50:
-        return ("WAIT — Don't chase sells",
-                f"If price breaks below {fmt_money(put_wall)} and stays there, sells. If it bounces up, wait.")
+        return ("WAIT — Don't chase puts",
+                f"If price breaks below {fmt_money(put_wall)} and stays there, puts. If it bounces up, wait.")
     if flip_f is None and net is not None and net < 0:
         return ("WAIT — Choppy, don't force a trade",
                 "Wait for a clear move up or down.")
     if flip_f is not None and spot_f is not None:
         if spot_f > flip_f:
-            return ("BUYS LOOK BETTER",
-                    "If price pulls back and holds above the mood line, buys. If it drops below the mood line, wait.")
-        return ("SELLS LOOK BETTER",
-                "If price bounces and holds below the mood line, sells. If it climbs above the mood line, wait.")
+            return ("CALLS LOOK BETTER",
+                    "If price pulls back and holds above the mood line, calls. If it drops below the mood line, wait.")
+        return ("PUTS LOOK BETTER",
+                "If price bounces and holds below the mood line, puts. If it climbs above the mood line, wait.")
     if spot_f is not None and pain_f is not None and abs(spot_f - pain_f) <= 25:
         return ("WAIT — May stay quiet",
                 f"Wait for a clear move away from {fmt_money(max_pain)}.")
@@ -479,16 +479,16 @@ def build_action(levels):
 def build_recommendation(levels):
     """Back-compat: one plain-English recommendation sentence."""
     headline, what_changes = build_action(levels)
-    if headline.startswith("WAIT — Don't chase buys"):
-        return "Don't chase buys up here. Wait for price to pull back, or wait for it to break above the ceiling and stay there."
-    if headline.startswith("WAIT — Don't chase sells"):
-        return "Don't chase sells down here. Wait for price to bounce up, or wait for it to break below the floor and stay there."
+    if headline.startswith("WAIT — Don't chase calls"):
+        return "Don't chase calls up here. Wait for price to pull back, or wait for it to break above the ceiling and stay there."
+    if headline.startswith("WAIT — Don't chase puts"):
+        return "Don't chase puts down here. Wait for price to bounce up, or wait for it to break below the floor and stay there."
     if headline.startswith("WAIT — Choppy"):
         return "Choppy today, don't force a trade. Wait for a clear move up or down."
-    if headline == "BUYS LOOK BETTER":
-        return "Buys look better than sells today. Look for buys on a pullback, don't chase sells."
-    if headline == "SELLS LOOK BETTER":
-        return "Sells look better than buys today. Look for sells on a bounce, don't chase buys."
+    if headline == "CALLS LOOK BETTER":
+        return "Calls look better than puts today. Look for calls on a pullback, don't chase puts."
+    if headline == "PUTS LOOK BETTER":
+        return "Puts look better than calls today. Look for puts on a bounce, don't chase calls."
     return what_changes
 
 
@@ -536,9 +536,9 @@ def build_gate_message(direction, price, decision, reason, levels, flip_used, fl
     """Short live gate alert, 3 lines. Action first. No jargon."""
     if decision == "PASSED":
         if direction == "CALL":
-            rec = "Try the buy, 1 contract only. Get out if it turns back below the mood line."
+            rec = "Try the call, 1 contract only. Get out if it turns back below the mood line."
         else:
-            rec = "Try the sell, 1 contract only. Get out if it turns back above the mood line."
+            rec = "Try the put, 1 contract only. Get out if it turns back above the mood line."
         action = "TRY IT"
     else:
         rec = "Wait for the next clear setup."
@@ -578,27 +578,27 @@ def build_live_message(event, levels, spot):
         "ceiling_touch": (
             f"CEILING HIT — SPX {fmt_money(call_wall)}",
             "Price just reached the ceiling.",
-            "Don't chase buys here, wait for a pullback or a break above and hold."),
+            "Don't chase calls here, wait for a pullback or a break above and hold."),
         "ceiling_break": (
             f"CEILING BROKE — SPX {fmt_money(call_wall)}",
             "Price broke above the ceiling and is holding above it.",
-            "Buys look better now, look for buys on a pullback."),
+            "Calls look better now, look for calls on a pullback."),
         "floor_touch": (
             f"FLOOR HIT — SPX {fmt_money(put_wall)}",
             "Price just reached the floor.",
-            "Don't chase sells here, wait for a bounce or a break below and hold."),
+            "Don't chase puts here, wait for a bounce or a break below and hold."),
         "floor_break": (
             f"FLOOR BROKE — SPX {fmt_money(put_wall)}",
             "Price broke below the floor and is holding below it.",
-            "Sells look better now, look for sells on a bounce."),
+            "Puts look better now, look for puts on a bounce."),
         "mood_cross_up": (
             f"MOOD LINE CROSSED UP — SPX {fmt_money(flip)}",
             "Price just moved above the mood line.",
-            "Buys look better now, look for buys on a pullback."),
+            "Calls look better now, look for calls on a pullback."),
         "mood_cross_down": (
             f"MOOD LINE CROSSED DOWN — SPX {fmt_money(flip)}",
             "Price just moved below the mood line.",
-            "Sells look better now, look for sells on a bounce."),
+            "Puts look better now, look for puts on a bounce."),
         "drift_reached": (
             f"DRIFT LEVEL REACHED — SPX {fmt_money(max_pain)}",
             "Price just reached where it tends to drift toward.",
