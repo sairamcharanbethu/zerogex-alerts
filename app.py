@@ -23,8 +23,11 @@ The user places every trade himself in Wealthsimple.
 
 Alert schedule (user choice, 2026-11-24 - "Morning + live alerts + close"):
   - 08:30 ET weekdays: morning levels alert (plain English)
-  - Live, only when it matters: price hits/breaks ceiling/floor, or a
-    ChartGT webhook gate PASSED/BLOCKED - one plain line why
+  - Live, only when it matters: price hits/breaks ceiling/floor, crosses
+    the mood line, or reaches the price it tends to drift toward - checked
+    every 60 sec in session by the ZeroGEX-only level watcher, one alert
+    per level per day. A ChartGT webhook gate PASSED/BLOCKED also posts here
+    when ChartGT is connected (it is not yet - see below).
   - 14:30 ET weekdays: close alert - where price is vs the price it
     tends to drift toward, what to watch into the close
   - NO noon alert, NO hourly ping, NO overnight alerts. About 3-5
@@ -42,6 +45,10 @@ Endpoints:
   POST /alert/morning        -> send the morning levels alert now
   POST /alert/close          -> send the close alert now
   POST /alert/test           -> send a test Discord message
+  POST /alert/live-test      -> send a sample live level alert (no arming)
+                               {"event": "ceiling_touch"|"ceiling_break"|
+                                "floor_touch"|"floor_break"|"mood_cross_up"|
+                                "mood_cross_down"|"drift_reached"}
 """
 import json
 import os
@@ -103,6 +110,8 @@ state = {
     "poll_count": 0,
     "decisions": [],  # last 20 gate decisions, newest first
     "sent_slots": {},  # e.g. {"2026-11-24 morning": true} - one send per slot per day
+    "prev_spot": None,  # last in-session SPX 0DTE spot, for crossing detection
+    "live_alerts": {},  # e.g. {"2026-11-24 ceiling_touch": true} - one per event per day
 }
 _state_lock = threading.Lock()
 
@@ -125,7 +134,7 @@ def load_state():
         with _state_lock:
             for key in ("spx_0dte", "spx_all", "spy_all", "imbalance",
                         "last_fetch", "last_fetch_ok", "last_error", "poll_count",
-                        "sent_slots", "decisions"):
+                        "sent_slots", "decisions", "prev_spot", "live_alerts"):
                 if key in data:
                     state[key] = data[key]
         log("loaded cached state from disk")
@@ -256,7 +265,22 @@ def poller_loop():
                 log("poller waiting: zerogex not configured (set ZEROGEX_API_KEY in Coolify)")
                 time.sleep(300)
                 continue
+            with _state_lock:
+                prev_spot = state.get("prev_spot")
+                prev_levels = state.get("spx_0dte")
             poll_once()
+            with _state_lock:
+                levels = state.get("spx_0dte")
+                if levels and levels.get("spot") is not None:
+                    state["prev_spot"] = levels.get("spot")
+            # ZeroGEX-only live alerts: only from the poller, only in session.
+            # (Manual /alert/* calls and scheduler fetches do not trigger these.)
+            try:
+                if levels:
+                    check_live_levels(prev_spot, levels)
+            except Exception as exc:
+                log(f"live alert check error: {exc}")
+            save_state()
         except Exception as exc:
             log(f"poller cycle error: {exc}")
         time.sleep(IN_SESSION_POLL if in_session() else OUT_SESSION_POLL)
@@ -527,6 +551,155 @@ def build_gate_message(direction, price, decision, reason, levels, flip_used, fl
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- live level alerts (ZeroGEX only)
+# User choice 2026-11-24: ZeroGEX-only live alerts, no ChartGT needed.
+# The poller already checks levels every 60s in session; this watcher
+# speaks up only when price actually reaches a level. Each event fires
+# once per level per day, so a price sitting on a wall does not spam.
+# Events: ceiling touch (within 5 pts), ceiling break (cross above),
+# floor touch, floor break, mood-line cross, drift-toward reached.
+# 3-line messages, same short format as the gate. In session only,
+# fresh levels only (age < 10 min). These are "pay attention, price is
+# at a line that matters" alerts, NOT entry signals - ZeroGEX's own
+# signals run ~50% on a 60-min horizon, so the user still times the
+# actual trade on his chart.
+TOUCH_BUFFER = 5.0  # pts: price within this of a level counts as a touch
+LIVE_EVENTS = ("ceiling_touch", "ceiling_break", "floor_touch", "floor_break",
+               "mood_cross_up", "mood_cross_down", "drift_reached")
+
+
+def build_live_message(event, levels, spot):
+    """3-line live level alert. No jargon."""
+    call_wall = levels.get("call_wall") if levels else None
+    put_wall = levels.get("put_wall") if levels else None
+    max_pain = levels.get("max_pain") if levels else None
+    flip = levels.get("gamma_flip") if levels else None
+    texts = {
+        "ceiling_touch": (
+            f"CEILING HIT — SPX {fmt_money(call_wall)}",
+            "Price just reached the ceiling.",
+            "Don't chase buys here, wait for a pullback or a break above and hold."),
+        "ceiling_break": (
+            f"CEILING BROKE — SPX {fmt_money(call_wall)}",
+            "Price broke above the ceiling and is holding above it.",
+            "Buys look better now, look for buys on a pullback."),
+        "floor_touch": (
+            f"FLOOR HIT — SPX {fmt_money(put_wall)}",
+            "Price just reached the floor.",
+            "Don't chase sells here, wait for a bounce or a break below and hold."),
+        "floor_break": (
+            f"FLOOR BROKE — SPX {fmt_money(put_wall)}",
+            "Price broke below the floor and is holding below it.",
+            "Sells look better now, look for sells on a bounce."),
+        "mood_cross_up": (
+            f"MOOD LINE CROSSED UP — SPX {fmt_money(flip)}",
+            "Price just moved above the mood line.",
+            "Buys look better now, look for buys on a pullback."),
+        "mood_cross_down": (
+            f"MOOD LINE CROSSED DOWN — SPX {fmt_money(flip)}",
+            "Price just moved below the mood line.",
+            "Sells look better now, look for sells on a bounce."),
+        "drift_reached": (
+            f"DRIFT LEVEL REACHED — SPX {fmt_money(max_pain)}",
+            "Price just reached where it tends to drift toward.",
+            "It may stay quiet here, wait for a clear move away."),
+    }
+    title, what, rec = texts[event]
+    return "\n".join([title, what, rec])
+
+
+def check_live_levels(prev_spot, levels, now_et=None):
+    """Detect level events from one poll. Returns the event sent, or None.
+
+    prev_spot: spot from the previous in-session poll (None on first poll).
+    levels: current SPX 0DTE levels dict. Only runs in session, fresh only.
+    """
+    now_et = now_et or datetime.now(ET)
+    if not in_session(now_et) or not levels:
+        return None
+    try:
+        spot = float(levels.get("spot")) if levels.get("spot") is not None else None
+    except Exception:
+        return None
+    if spot is None:
+        return None
+    # Freshness: skip stale levels (age_seconds from the API, when present).
+    age = levels.get("age_seconds")
+    if age is not None:
+        try:
+            if float(age) > FRESH_SECONDS:
+                return None
+        except Exception:
+            pass
+    try:
+        call_f = float(levels["call_wall"]) if levels.get("call_wall") is not None else None
+        floor_f = float(levels["put_wall"]) if levels.get("put_wall") is not None else None
+        pain_f = float(levels["max_pain"]) if levels.get("max_pain") is not None else None
+        flip_f = float(levels["gamma_flip"]) if levels.get("gamma_flip") is not None else None
+    except Exception:
+        return None
+    prev_f = None
+    if prev_spot is not None:
+        try:
+            prev_f = float(prev_spot)
+        except Exception:
+            prev_f = None
+
+    # Work out which events fired, break before touch (a break also sits
+    # within touch range - report the break, and mark touch as seen too).
+    events = []
+    if call_f is not None:
+        broke = spot >= call_f and (prev_f is None or prev_f < call_f)
+        if broke:
+            events.append("ceiling_break")
+            events.append("ceiling_touch")  # mark seen, don't re-alert on pullback
+        elif abs(spot - call_f) <= TOUCH_BUFFER:
+            events.append("ceiling_touch")
+    if floor_f is not None:
+        broke = spot <= floor_f and (prev_f is None or prev_f > floor_f)
+        if broke:
+            events.append("floor_break")
+            events.append("floor_touch")
+        elif abs(spot - floor_f) <= TOUCH_BUFFER:
+            events.append("floor_touch")
+    if flip_f is not None and prev_f is not None:
+        if prev_f < flip_f <= spot:
+            events.append("mood_cross_up")
+        elif prev_f > flip_f >= spot:
+            events.append("mood_cross_down")
+    if pain_f is not None and abs(spot - pain_f) <= TOUCH_BUFFER:
+        events.append("drift_reached")
+
+    today = now_et.date().isoformat()
+    with _state_lock:
+        live = state.setdefault("live_alerts", {})
+        # prune other days so the dict stays small
+        state["live_alerts"] = {k: v for k, v in live.items() if k.startswith(today)}
+        live = state["live_alerts"]
+        pending = [e for e in events if f"{today} {e}" not in live]
+        if not pending:
+            return None
+        event = pending[0]
+        live[f"{today} {event}"] = True
+        if event in ("ceiling_break", "floor_break"):
+            # a break already implies the touch; mark it so a pullback
+            # to the wall does not fire a stale touch alert later
+            other = "ceiling_touch" if event == "ceiling_break" else "floor_touch"
+            live[f"{today} {other}"] = True
+    save_state()
+    msg = build_live_message(event, levels, spot)
+    result = post_discord(msg)
+    if result.get("sent"):
+        log(f"live alert sent: {event} at spot {spot}")
+        return event
+    # send failed - unmark so it retries on the next poll
+    with _state_lock:
+        state.get("live_alerts", {}).pop(f"{today} {event}", None)
+    save_state()
+    log(f"live alert {event}: Discord send failed, will retry next poll")
+    return None
+
+
 # ---------------------------------------------------------------- gate logic
 def _fresh_levels():
     """Return (levels, error). Levels must have been fetched <10 min ago."""
@@ -670,14 +843,14 @@ class Handler(BaseHTTPRequestHandler):
                 "zerogex_configured": bool(zerogex_key()),
                 "discord_configured": bool(discord_webhook()),
                 "in_session": in_session(),
-                "schedule": "morning 08:30 ET + close 14:30 ET weekdays, live gate alerts only; no noon/hourly/overnight",
+                "schedule": "morning 08:30 ET + close 14:30 ET weekdays, live ZeroGEX level alerts only; no noon/hourly/overnight",
             })
         elif path == "/":
             body = ("zerogex-alerts - SPX levels poller + ChartGT alert gate\n"
                     "GET /health\nGET /levels?symbol=SPX&expiration=0dte|all\n"
                     "POST /webhook/chartgt  {\"symbol\":\"SPX\",\"direction\":\"CALL|PUT\",\"price\":7237}\n"
-                    "POST /alert/morning\nPOST /alert/close\nPOST /alert/test\n"
-                    "Schedule: morning 08:30 ET + close 14:30 ET weekdays, live gate alerts only.\n").encode()
+                    "POST /alert/morning\nPOST /alert/close\nPOST /alert/test\nPOST /alert/live-test\n"
+                    "Schedule: morning 08:30 ET + close 14:30 ET weekdays, live ZeroGEX level alerts only.\n").encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
@@ -758,6 +931,25 @@ class Handler(BaseHTTPRequestHandler):
             msg = "Test OK - zerogex-alerts is working. You will get morning and trade alerts here."
             discord = post_discord(msg)
             self._send_json(200, {"sent": discord.get("sent"), "discord": discord, "message": msg})
+        elif path == "/alert/live-test":
+            # Sample a live level alert using current cached levels, without
+            # marking it as sent for the day. Body: {"event": "ceiling_touch"}
+            # (default) or any of LIVE_EVENTS. Market-closed safe: it only
+            # shows the format, it does not arm the watcher.
+            event = str((payload.get("event") or "ceiling_touch")).strip()
+            if event not in LIVE_EVENTS:
+                self._send_json(400, {"error": f"event must be one of {list(LIVE_EVENTS)}"})
+                return
+            with _state_lock:
+                levels = state.get("spx_0dte")
+            if not levels:
+                self._send_json(503, {"error": "no levels available",
+                                      "reason": "poller has not fetched levels yet - check ZEROGEX_API_KEY"})
+                return
+            msg = build_live_message(event, levels, levels.get("spot"))
+            discord = post_discord(msg)
+            self._send_json(200, {"sent": discord.get("sent"), "discord": discord,
+                                  "event": event, "message": msg})
         else:
             self._send_json(404, {"error": "not found"})
 
